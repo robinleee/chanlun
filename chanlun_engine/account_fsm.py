@@ -7,6 +7,7 @@ DEFAULT_STRATEGY_CONFIG = {
     "partial_take_profit": False,      # True = 涨 30% 时先平 1/3 仓（搭配 take_profit_pct=1.3 用）
     "first_tranche_ratio": 1.0,        # 首笔建仓用预算的比例（0.5 = 半仓）
     "signal_cooldown_bars": 0,        # 同一标的两个 INITIAL 之间最少隔多少根 bar（0=不限制）
+    "max_tranches": 2,                # 最大分批建仓次数（2=最多分两批买入）
 }
 
 
@@ -59,6 +60,8 @@ class AccountStateMachine:
 
         # A/B 测试用：上次 INITIAL 下单时的 bar 索引（用于信号冷却）
         self._last_buy_bar_idx = -10**9
+        # 分批建仓追踪：已完成的买入批次（INITIAL + ADD_POSITION）
+        self._tranche_count = 0
 
     @property
     def cash_on_hand(self):
@@ -92,7 +95,9 @@ class AccountStateMachine:
         # P0 硬止损：在任何状态机分支前检查，对 NORMAL_HOLDING 和 ZERO_COST_GAMING 都生效
         if hard_stop_pct > 0 and self.entry_avg_price > 0 and self.held_shares > 0:
             loss_pct = (current_price - self.entry_avg_price) / self.entry_avg_price
-            print(f"[FSM_CHECK] Stop Loss Check: {self.stock_code} | Price={current_price:.2f} | Entry Avg Price={self.entry_avg_price:.2f} | Loss={loss_pct:.2%} | Hard Stop Threshold={hard_stop_pct:.2%}")
+            # 仅在临近止损阈值（亏损过半）或实际触发时打印，避免日志噪音
+            if loss_pct <= -hard_stop_pct * 0.5:
+                print(f"[FSM_CHECK] Stop Loss Check: {self.stock_code} | Price={current_price:.2f} | Entry Avg Price={self.entry_avg_price:.2f} | Loss={loss_pct:.2%} | Hard Stop Threshold={hard_stop_pct:.2%}")
             if loss_pct <= -hard_stop_pct:
                 print(f"[FSM_ACTION] STOP_LOSS TRIGGERED (HARD STOP): {self.stock_code} | Price={current_price:.2f} | Shares={self.held_shares}")
                 self._register_order(order_id, "SELL", self.held_shares, current_price, "STOP_LOSS")
@@ -113,6 +118,19 @@ class AccountStateMachine:
                         self._last_buy_bar_idx = bar_ts
 
         elif self.state == AccountState.NORMAL_HOLDING:
+            # ── 分批加仓：持有时收到买入信号，用剩余本金追加仓位 ──
+            if signal in ["RETAIL_2BUY", "RETAIL_3BUY", "CROSS_1ClassBuy"]:
+                max_n = cfg.get("max_tranches", 2)
+                if self._tranche_count < max_n and self.cash_unspent > 0:
+                    target_shares = int(self.cash_unspent / current_price / 100) * 100
+                    if target_shares >= 100:
+                        buy_price = current_price
+                        self._register_order(order_id, "BUY", target_shares, buy_price, "ADD_POSITION")
+                        self._tranche_count += 1
+                        if bar_ts is not None:
+                            self._last_buy_bar_idx = bar_ts
+                        return
+            # ── 原有卖点逻辑 ──
             if signal in ["3ClassSell", "CROSS_1ClassSell"]:
                 if can_sell > 0:
                     print(f"[FSM_ACTION] EXIT TRIGGERED ({signal}): {self.stock_code} | Price={current_price:.2f} | Shares={can_sell}")
@@ -239,8 +257,19 @@ class AccountStateMachine:
             self.cash_uninvested = volume * price
             self.cash_unspent = max(0.0, self.cash_unspent - volume * price)
             self.state = AccountState.NORMAL_HOLDING
+            self._tranche_count = 1  # 第一批已买入
+
+        elif order_type == "ADD_POSITION":
+            # 分批加仓：新买入追加到已有持仓，更新加权均价
+            total_cost = self.held_shares * self.entry_avg_price + volume * price
+            self.held_shares += volume
+            self.entry_avg_price = total_cost / self.held_shares
+            self.cash_uninvested += volume * price
+            self.cash_unspent = max(0.0, self.cash_unspent - volume * price)
+            # 保持在 NORMAL_HOLDING 状态
 
         elif order_type == "STOP_LOSS":
+            # 止损：清空持仓与原始本金；将所有现存资金重整并归还
             total_cash = self.cash_unspent + self.maneuver_cash + volume * price
             self.held_shares = 0
             self.sellable_shares = 0
@@ -248,8 +277,10 @@ class AccountStateMachine:
             self.cash_unspent = total_cash * 0.9
             self.maneuver_cash = total_cash * 0.1
             self.state = AccountState.EMPTY
+            self._tranche_count = 0
 
         elif order_type == "RECOVER":
+            # RECOVER：held 一定减少；sellable 减少但不能为负（强制离场绕过 T+1 时保护）
             self.held_shares -= volume
             self.sellable_shares = max(0, self.sellable_shares - volume)
             self.cash_uninvested = max(0.0, self.cash_uninvested - volume * price)
@@ -257,6 +288,7 @@ class AccountStateMachine:
             self.state = AccountState.ZERO_COST_GAMING
 
         elif order_type == "MACRO_SELL":
+            # 大级别顶部：与 STOP_LOSS 一致，回收全部金额重整
             total_cash = self.cash_unspent + self.maneuver_cash + volume * price
             self.held_shares = 0
             self.sellable_shares = 0
@@ -266,8 +298,10 @@ class AccountStateMachine:
             self.state = AccountState.EMPTY
             self.t0_sell_cache = 0
             self.t0_buy_cache = 0
+            self._tranche_count = 0
 
         elif order_type == "MELTDOWN":
+            # 小转大熔断：清仓，回收金额重整
             total_cash = self.cash_unspent + self.maneuver_cash + volume * price
             self.held_shares -= volume
             self.sellable_shares -= volume
@@ -276,6 +310,7 @@ class AccountStateMachine:
                 self.cash_unspent = total_cash * 0.9
                 self.maneuver_cash = total_cash * 0.1
                 self.state = AccountState.EMPTY
+                self._tranche_count = 0
             else:
                 self.cash_uninvested = max(0.0, self.cash_uninvested - volume * price)
                 self.maneuver_cash += volume * price
@@ -295,6 +330,7 @@ class AccountStateMachine:
             self.t0_sell_cache = 0
 
         elif order_type == "T0_BUY":
+            # T+0 买入在当日不可卖（受 T+1 约束）
             self.t0_buy_cache += volume
             self.held_shares += volume
             self.maneuver_cash -= volume * price
