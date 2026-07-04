@@ -123,49 +123,80 @@ class MultiTimeframeScanner:
 
     def check_interval_套_convergence(self, close_5m, latest_5m_skline, geo_signal_5m="NO_SIGNAL"):
         """
-        区间套联动校验：以 5m 真实中枢进入段 s1 与离开段 s3 的真实标准 K 线索引范围切片进行 MACD 面积计算。
-        优先使用 engine.macd_hist（增量维护，O(1) 读取）；回退到全量 compute_macd_hist 用于无 hist 缓存的场景。
+        区间套联动校验：两级共振独立尝试，任意一级检测到背驰+方向确认即返回共振信号。
 
-        跨周期共振条件不满足（无中枢 / 段数 < 3）时，回退到 5m 单级别信号
-        （由调用方通过 geo_signal_5m 传入）。这样即便 SegmentEngine 在真实数据上
-        长期卡在 active 状态（confirmed_segments 很少），FSM 仍能基于单级别
-        几何信号下单，先验证信号链路。
+        两级共振策略：
+          1. 宏级别引擎（engine_5m）：线段/中枢做背驰检测，micro 引擎做精确确认
+          2. 微级别引擎（engine_1m）：线段/中枢做背驰检测，macro 引擎做方向确认
+          两级独立尝试，互不阻塞。两级都失败时才回退到单级别几何信号。
+
+        设计要点：强单边趋势中宏级别线段形成缓慢且背驰难以触发，
+        微级别数据更丰富，可作为独立共振来源。
         """
-        cached_hist = getattr(self.engine_5m, "macd_hist", None)
-        hist_5m = cached_hist if cached_hist else self.divergence_engine.compute_macd_hist(close_5m)
+        # 提取 helper：对给定引擎和确认方向做一次背驰检测
+        def _try_resonance(seg_engine, confirm_engine, close_history, latest_skline, tag):
+            """返回共振信号或 None"""
+            if (seg_engine.active_segment is None
+                    or seg_engine.current_zhongshu is None
+                    or len(seg_engine.confirmed_segments) < 3):
+                return None
 
-        if not self.engine_5m.active_segment or not self.engine_5m.current_zhongshu or len(self.engine_5m.confirmed_segments) < 3:
-            return geo_signal_5m
+            cached_hist = getattr(seg_engine, "macd_hist", None)
+            hist = cached_hist if cached_hist else self.divergence_engine.compute_macd_hist(close_history)
 
-        s1 = self.engine_5m.confirmed_segments[-3]  # 进入中枢前的段
-        s3 = self.engine_5m.confirmed_segments[-1]  # 离开中枢的段
+            s1 = seg_engine.confirmed_segments[-3]
+            s3 = seg_engine.confirmed_segments[-1]
 
-        b_start = s1.start_bi.start.index
-        b_end = s1.current_end_bi.end.index
+            b_start = s1.start_bi.start.index
+            b_end = s1.current_end_bi.end.index
+            c_start = s3.start_bi.start.index
+            c_end = latest_skline.index
 
-        c_start = s3.start_bi.start.index
-        c_end = latest_5m_skline.index
+            if c_end >= len(hist) or b_end >= len(hist):
+                return None
 
-        if c_end >= len(hist_5m) or b_end >= len(hist_5m):
-            return "NO_SIGNAL"
+            areas_b = self.divergence_engine.calculate_wave_areas(hist, b_start, b_end)
+            areas_c = self.divergence_engine.calculate_wave_areas(hist, c_start, c_end)
 
-        areas_b = self.divergence_engine.calculate_wave_areas(hist_5m, b_start, b_end)
-        areas_c = self.divergence_engine.calculate_wave_areas(hist_5m, c_start, c_end)
+            is_divergent = sum(areas_c) < sum(areas_b)
+            if not is_divergent:
+                return None
 
-        is_5m_divergent_pending = sum(areas_c) < sum(areas_b)
-
-        if is_5m_divergent_pending:
-            signal_1m = self.engine_1m.get_latest_signal()
-            final_signal = "NO_SIGNAL"
-            if self.engine_5m.active_segment.direction == "UP" and signal_1m == "1m_1ClassSell":
+            confirm_signal = confirm_engine.get_latest_signal()
+            final_signal = None
+            if seg_engine.active_segment.direction == "UP" and confirm_signal in ("1m_1ClassSell", "3ClassSell"):
                 final_signal = "CROSS_1ClassSell"
-            elif self.engine_5m.active_segment.direction == "DOWN" and signal_1m == "1m_1ClassBuy":
+            elif seg_engine.active_segment.direction == "DOWN" and confirm_signal in ("1m_1ClassBuy", "RETAIL_2BUY", "RETAIL_3BUY"):
                 final_signal = "CROSS_1ClassBuy"
-            
-            if final_signal != "NO_SIGNAL":
-                print(f"[SCANNER] 5m+1m Scanner Check: {self.stock_code} | Entering Segment s1 (start={b_start}, end={b_end}) MACD area={sum(areas_b):.4f} | Leaving Segment s3 (start={c_start}, end={c_end}) MACD area={sum(areas_c):.4f} | 5m Divergent={is_5m_divergent_pending} | 1m Signal={signal_1m} -> Final Signal={final_signal}")
-                return final_signal
 
+            if final_signal:
+                se = "macro" if seg_engine is self.engine_5m else "micro"
+                print(f"[SCANNER] [{tag}] {self.stock_code} | "
+                      f"{se}-level s1 (bi {b_start}→{b_end}) MACD area={sum(areas_b):.4f} | "
+                      f"s3 (bi {c_start}→{c_end}) MACD area={sum(areas_c):.4f} | "
+                      f"Divergent={is_divergent} | confirm_signal={confirm_signal} -> {final_signal}")
+            return final_signal
+
+        # ──── 第 1 级：宏级别引擎共振 ────
+        result = _try_resonance(
+            self.engine_5m, self.engine_1m,
+            close_5m, latest_5m_skline, "MACRO"
+        )
+        if result:
+            return result
+
+        # ──── 第 2 级：微级别引擎共振（独立尝试，不依赖宏级别结果） ────
+        close_1m = self.engine_1m.get_close_history()
+        latest_1m = self.engine_1m.sklines[-1] if self.engine_1m.sklines else None
+        if latest_1m is not None:
+            result = _try_resonance(
+                self.engine_1m, self.engine_5m,
+                close_1m, latest_1m, "MICRO"
+            )
+            if result:
+                return result
+
+        # 两级都失败 → 回退单级别几何信号
         return geo_signal_5m
 
 class SmallToLargeGateway:
@@ -185,6 +216,11 @@ class SmallToLargeGateway:
             return False
 
         latest_1m_signal = engine_1m.get_latest_signal()
+        # TODO: 1m_3ClassSell 是计划中的微级别三卖信号（反弹无力回到中枢下方），
+        # 比 1m_1ClassSell 更适合作为熔断触发条件。当前 ChanEngine 卖点端尚未
+        # 实现微级别一卖/三卖的区分逻辑（参见 _update_geometry_topology:483），
+        # 仅产出 1m_1ClassSell。实现后可将熔断门槛从"任意微级别卖点"收紧为
+        # "仅三卖"，减少假熔断。
         if latest_1m_signal not in ["1m_3ClassSell", "1m_1ClassSell"]:
             return False
 

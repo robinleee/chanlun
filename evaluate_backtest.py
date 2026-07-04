@@ -45,6 +45,21 @@ DATA_WARNING_RE = re.compile(
     r"警告: 本地数据库中\s*(?P<code>\S+)\s*的\s*(?P<period>\S+)\s*K线数据不足"
 )
 
+BACKTEST_CONFIG_RE = re.compile(
+    r"\[BACKTEST_CONFIG\]\s*start_date=(?P<start_date>\d+)\s*\|\s*"
+    r"end_date=(?P<end_date>\d+)\s*\|\s*"
+    r"macro_period=(?P<macro_period>\S+)\s*\|\s*"
+    r"micro_period=(?P<micro_period>\S+)"
+)
+
+BACKTEST_POOL_RE = re.compile(
+    r"\[BACKTEST_POOL\]\s*原始股票池\s*\(共(?P<count>\d+)只\)\s*:\s*(?P<codes>.+)"
+)
+
+BACKTEST_STRATEGY_RE = re.compile(
+    r"\[BACKTEST_STRATEGY\]\s*(?P<kv_pairs>.+)"
+)
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser(description="Evaluate Chanlun Backtest Logs")
     parser.add_argument("log_file", nargs="?", help="Path to the backtest log file")
@@ -124,6 +139,37 @@ def parse_log_line(line):
             "code": m.group("code"),
             "period": m.group("period")
         }
+    m = BACKTEST_CONFIG_RE.search(line)
+    if m:
+        return {
+            "event_type": "BACKTEST_CONFIG",
+            "start_date": m.group("start_date"),
+            "end_date": m.group("end_date"),
+            "macro_period": m.group("macro_period"),
+            "micro_period": m.group("micro_period")
+        }
+    m = BACKTEST_POOL_RE.search(line)
+    if m:
+        codes_str = m.group("codes").strip()
+        codes = [c.strip() for c in codes_str.split(",") if c.strip()]
+        return {
+            "event_type": "BACKTEST_POOL",
+            "count": int(m.group("count")),
+            "codes": codes
+        }
+    m = BACKTEST_STRATEGY_RE.search(line)
+    if m:
+        kv_str = m.group("kv_pairs")
+        pairs = {}
+        for part in kv_str.split("|"):
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                pairs[k.strip()] = v.strip()
+        return {
+            "event_type": "BACKTEST_STRATEGY",
+            "pairs": pairs
+        }
     return None
 
 def reconstruct_trades(lines):
@@ -139,7 +185,14 @@ def reconstruct_trades(lines):
         "last_date": None,
         "dates_list": [],
         "pool_sizes": [],
-        "orders_triggered": {}
+        "orders_triggered": {},
+        # 回测配置信息（从日志中解析）
+        "backtest_start_date": None,
+        "backtest_end_date": None,
+        "macro_period": None,
+        "micro_period": None,
+        "stock_pool": [],
+        "strategy_config": {}
     }
 
     for line in lines:
@@ -163,6 +216,18 @@ def reconstruct_trades(lines):
 
         if event["event_type"] == "DATA_WARNING":
             stats["data_warnings"] += 1
+
+        elif event["event_type"] == "BACKTEST_CONFIG":
+            stats["backtest_start_date"] = event["start_date"]
+            stats["backtest_end_date"] = event["end_date"]
+            stats["macro_period"] = event["macro_period"]
+            stats["micro_period"] = event["micro_period"]
+
+        elif event["event_type"] == "BACKTEST_POOL":
+            stats["stock_pool"] = event["codes"]
+
+        elif event["event_type"] == "BACKTEST_STRATEGY":
+            stats["strategy_config"] = event["pairs"]
 
         elif event["event_type"] == "BI":
             stats["bi_count"] += 1
@@ -307,6 +372,7 @@ def calculate_metrics(recon):
         if entry_date and exit_date and entry_date in dates_list and exit_date in dates_list:
             hold_days = dates_list.index(exit_date) - dates_list.index(entry_date)
         else:
+            # Fallback to date diff calculation if not in dates_list, or simply 0
             hold_days = 0.0
         
         if t["pnl"] > 0:
@@ -358,7 +424,33 @@ def build_markdown_report(log_path, metrics, recon):
     import datetime
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     status = "已完成" if metrics["is_completed"] else "异常中断"
-    
+    recon_stats = recon["stats"]
+
+    # ---- 回测基本信息 ----
+    start_d = recon_stats.get("backtest_start_date") or "未知"
+    end_d = recon_stats.get("backtest_end_date") or "未知"
+    macro_p = recon_stats.get("macro_period") or "未知"
+    micro_p = recon_stats.get("micro_period") or "未知"
+    pool = recon_stats.get("stock_pool") or []
+
+    # 格式化日期
+    def _fmt_date(d):
+        if len(d) == 8:
+            return f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        return d
+
+    pool_str = ", ".join(pool) if pool else "（未从日志解析到股票池，请确认日志包含 [BACKTEST_POOL] 行）"
+    pool_count = len(pool) if pool else 0
+    start_display = _fmt_date(start_d)
+    end_display = _fmt_date(end_d)
+
+    # ---- 策略参数 ----
+    cfg = recon_stats.get("strategy_config") or {}
+    if cfg:
+        cfg_rows = "\n".join([f"| `{k}` | `{v}` |" for k, v in cfg.items()])
+    else:
+        cfg_rows = "| （未从日志解析到策略参数） |"
+
     # Generate recommendations
     recs = []
     if metrics["win_rate"] < 40.0:
@@ -399,6 +491,26 @@ def build_markdown_report(log_path, metrics, recon):
 **评估日期**: {date_str}
 **目标日志文件**: `{log_path}`
 **回测状态**: {status} (末次基准日期: {metrics["last_date"]})
+
+## 0. 回测基本信息
+
+### 时间区间与周期
+| 项目 | 值 |
+|---|---|
+| 回测起始日期 | {start_display} |
+| 回测结束日期 | {end_display} |
+| 主操作周期 (macro) | {macro_p} |
+| 精确入场周期 (micro) | {micro_p} |
+
+### 股票池 (共 {pool_count} 只)
+```
+{pool_str}
+```
+
+### 策略配置参数
+| 参数 | 值 |
+|---|---|
+{cfg_rows}
 
 ## 1. 引擎健康度与完整性诊断
 | 诊断指标 | 数值 | 状态 |
@@ -471,10 +583,18 @@ def main():
 
     # Print summary to console
     print("\n" + "="*50)
+      # Using center format
     print("          缠论引擎评估诊断摘要 (Console Dashboard)")
     print("="*50)
     print(f"解析日志文件: {log_path}")
     print(f"回测状态: {'已完成' if metrics['is_completed'] else '异常中断'} (末次基准日期: {metrics['last_date']})")
+    print(f"回测区间: {recon['stats'].get('backtest_start_date','?')} -> {recon['stats'].get('backtest_end_date','?')}"
+          f" | 周期: {recon['stats'].get('macro_period','?')}/{recon['stats'].get('micro_period','?')}")
+    pool = recon['stats'].get('stock_pool') or []
+    print(f"股票池 ({len(pool)}只): {', '.join(pool) if pool else '?'}")
+    cfg = recon['stats'].get('strategy_config') or {}
+    if cfg:
+        print(f"策略配置: {' | '.join(f'{k}={v}' for k,v in cfg.items())}")
     print(f"数据短缺警告次数: {metrics['data_warnings']}")
     print(f"确认笔/段数量: {metrics['bi_count']} / {metrics['segment_count']}")
     print(f"建平仓交易笔数: {metrics['completed_count']} | 交易胜率: {metrics['win_rate']:.2f}%")
